@@ -1,0 +1,636 @@
+"""Reglas de negocio de pedidos (Order) y checkout.
+
+El flujo activo de SeizeMB es contra entrega (efectivo o Nequi) con
+confirmación de las dos partes. Wompi queda en el backend por si se
+reactiva, pero no es el método por defecto ni hace falta configurarlo.
+"""
+
+import hashlib
+import logging
+import secrets
+from datetime import datetime, timedelta, timezone
+from decimal import ROUND_HALF_UP, Decimal
+
+from sqlalchemy.orm import Session
+
+from app.core.config import settings
+from app.models.order import (
+    ACTIVE_ORDER_STATUSES,
+    COMMITTED_ORDER_STATUSES,
+    COMPLETED_ORDER_STATUSES,
+    CONTRA_ENTREGA,
+    ClosedBy,
+    Order,
+    OrderItem,
+    OrderStatus,
+    PaymentMethod,
+)
+from app.repositories import cart_repository, product_repository
+from app.services.product_service import ProductUnavailableError
+
+logger = logging.getLogger("seizemb.orders")
+
+# Estados finales que puede reportar Wompi para una transacción. Wompi
+# también puede mandar eventos con status intermedios (ej. "PENDING") que
+# simplemente ignoramos hasta que llegue el estado final.
+_WOMPI_TERMINAL_STATUSES = {"APPROVED", "DECLINED", "VOIDED", "ERROR"}
+
+# Transiciones de LOGÍSTICA que puede disparar la dueña desde el panel.
+# Nunca se puede saltar un paso: para cerrar un pedido hay que haber
+# declarado antes que se entregó y se cobró.
+_DELIVERY_TRANSITIONS: dict[OrderStatus, set[OrderStatus]] = {
+    # Wompi: se pagó antes, así que la logística arranca desde APPROVED.
+    OrderStatus.APPROVED: {OrderStatus.IN_TRANSIT},
+    # Contra entrega: no hay pago previo, arranca desde CONFIRMED.
+    OrderStatus.CONFIRMED: {OrderStatus.IN_TRANSIT},
+    OrderStatus.IN_TRANSIT: {OrderStatus.AWAITING_CONFIRMATION},
+    # Cerrar el pedido cuando la clienta no confirma. Antes esto lo hacía
+    # solo un barrido a los 5 días; se quitó porque corría de forma
+    # perezosa (solo si alguien listaba pedidos) y no era base confiable
+    # para un acuerdo que se le muestra a la clienta. Ahora es explícito:
+    # alguien decide cerrarlo y queda registrado quién y cuándo.
+    OrderStatus.AWAITING_CONFIRMATION: {OrderStatus.DELIVERED},
+}
+
+# Después de este tiempo sin respuesta de Wompi, asumimos que el usuario
+# abandonó el pago. Contra entrega no usa este TTL.
+PENDING_ORDER_TTL_HOURS = 2
+
+# Cuántos pedidos contra entrega puede tener abiertos una misma persona a
+# la vez.
+#
+# Un contra entrega NO expira (a diferencia de PENDING, que se barre a
+# las 2 h). Sin tope, cualquiera que se registre puede inundar el panel
+# con pedidos que nunca va a recibir.
+#
+# 3 deja pedir de nuevo mientras esperas una entrega, sin volver el
+# acaparamiento gratis.
+MAX_PEDIDOS_CONTRA_ENTREGA_ABIERTOS = 3
+
+
+class EmptyCartError(Exception):
+    pass
+
+
+class TooManyOpenOrdersError(Exception):
+    pass
+
+
+class OrderNotFoundError(Exception):
+    pass
+
+
+class InvalidStatusTransitionError(Exception):
+    pass
+
+
+class WompiNotConfiguredError(Exception):
+    pass
+
+
+class WompiEventMismatchError(Exception):
+    """El evento viene firmado por Wompi, pero no corresponde a este
+    pedido (otro monto, otra moneda, o una transacción ya usada en otro
+    pedido). Ver `_validate_event_matches_order`."""
+
+
+def expire_stale_orders(db: Session) -> int:
+    """Marca como EXPIRED los pedidos PENDING más viejos que el TTL.
+
+    Se llama de forma "perezosa" (al listar o crear pedidos) en vez de
+    necesitar un cron aparte: para el volumen de una tienda chica/mediana
+    alcanza y sobra, y es una línea menos de infraestructura que mantener.
+    """
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=PENDING_ORDER_TTL_HOURS)
+    stale_orders = (
+        db.query(Order)
+        .filter(Order.status == OrderStatus.PENDING, Order.created_at < cutoff)
+        .all()
+    )
+    for order in stale_orders:
+        order.status = OrderStatus.EXPIRED
+    if stale_orders:
+        db.commit()
+    return len(stale_orders)
+
+
+def _generate_reference(order_id: int) -> str:
+    # Wompi no permite reusar una referencia jamás, ni siquiera para el
+    # mismo pedido en un segundo intento de pago. El sufijo aleatorio
+    # evita choques si el usuario reintenta pagar el mismo pedido.
+    return f"seizemb-{order_id}-{secrets.token_hex(4)}"
+
+
+def to_cents(amount: Decimal) -> int:
+    """Pesos -> centavos, que es la unidad en la que Wompi cobra.
+
+    El redondeo se hace sobre el Decimal (nunca sobre un float): con
+    float, un total de 1234.565 puede quedar en 123456 centavos en vez de
+    123457, y ese centavo de diferencia hace que la firma de integridad
+    no cuadre y Wompi rechace el pago.
+    """
+    return int(Decimal(amount).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP) * 100)
+
+
+def _sign(reference: str, amount_in_cents: int, currency: str) -> str:
+    if not settings.WOMPI_INTEGRITY_SECRET:
+        raise WompiNotConfiguredError("Falta configurar WOMPI_INTEGRITY_SECRET.")
+    raw = f"{reference}{amount_in_cents}{currency}{settings.WOMPI_INTEGRITY_SECRET}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _cart_matches_order(order: Order, cart_items: list) -> bool:
+    """Si el carrito es idéntico al pedido, se reusa en vez de crear otro.
+
+    El color entra en la clave: el mismo artículo en azul y en negro son
+    dos líneas distintas. Sin él, cambiar de color en el carrito y volver
+    a pedir reusaría el pedido viejo.
+    """
+    order_map = {(item.product_id, item.color): item.quantity for item in order.items}
+    cart_map = {(item.product_id, item.color): item.quantity for item in cart_items}
+    return order_map == cart_map
+
+
+def create_order_from_cart(
+    db: Session, *, user_id: int, payment_method: PaymentMethod = PaymentMethod.CASH
+) -> Order:
+    """Congela el carrito actual del usuario en un pedido nuevo.
+
+    No hay inventario: se pide a demanda. Si el producto ya no existe o
+    el admin lo marcó como no disponible, se avisa acá.
+
+    Idempotente: si el usuario ya tiene un pedido en el estado inicial
+    con exactamente el mismo contenido (mismo producto/color/cantidad),
+    se reusa ese en vez de crear uno nuevo — evita duplicados por doble
+    clic o por un reintento de red del botón de pedir.
+    """
+    expire_stale_orders(db)
+
+    # Con Wompi el pedido nace PENDING y espera el pago. Contra entrega
+    # nace CONFIRMED: no hay nada que esperar, la plata llega al entregar.
+    estado_inicial = (
+        OrderStatus.PENDING
+        if payment_method == PaymentMethod.WOMPI
+        else OrderStatus.CONFIRMED
+    )
+
+    cart_items = cart_repository.list_by_user(db, user_id)
+    if not cart_items:
+        raise EmptyCartError("El carrito está vacío.")
+
+    if payment_method in CONTRA_ENTREGA:
+        abiertos = (
+            db.query(Order)
+            .filter(
+                Order.user_id == user_id,
+                Order.status == OrderStatus.CONFIRMED,
+            )
+            .count()
+        )
+        if abiertos >= MAX_PEDIDOS_CONTRA_ENTREGA_ABIERTOS:
+            raise TooManyOpenOrdersError(
+                f"Ya tienes {abiertos} pedidos pendientes de entrega. Espera a "
+                "recibirlos o cancela alguno antes de hacer otro."
+            )
+
+    # La idempotencia mira el estado inicial que corresponda al método:
+    # un doble clic en "pedir con Nequi" tiene que reusar el CONFIRMED
+    # que acaba de crear, no armar un pedido nuevo.
+    existing_pending = (
+        db.query(Order)
+        .filter(
+            Order.user_id == user_id,
+            Order.status == estado_inicial,
+            Order.payment_method == payment_method,
+        )
+        .order_by(Order.created_at.desc())
+        .first()
+    )
+    if existing_pending is not None and _cart_matches_order(existing_pending, cart_items):
+        return existing_pending
+
+    order_items = []
+    total = Decimal("0")
+    for item in cart_items:
+        product = product_repository.get_by_id(db, item.product_id)
+        if product is None or not product.in_stock:
+            raise ProductUnavailableError(
+                f"El producto #{item.product_id} ya no está disponible."
+            )
+        order_items.append(
+            OrderItem(
+                product_id=product.id,
+                product_name=product.name,
+                # El color se congela igual que el nombre y el precio: si
+                # mañana dejan de ofrecerlo, el pedido viejo sigue
+                # diciendo cuál se pidió.
+                color=item.color,
+                unit_price=product.price,
+                # Foto del COSTO en el momento de la venta, igual que ya
+                # se hace con unit_price. Si el costo del producto cambia
+                # después, las ventas viejas no se ven afectadas — y los
+                # reportes de /sales calculan la ganancia real de cada
+                # venta, no la ganancia "si hoy costara lo que cuesta hoy".
+                unit_cost=product.cost,
+                quantity=item.quantity,
+            )
+        )
+        # product.price es Numeric(10,2) -> Decimal. Sumar en Decimal y no
+        # en float es lo que garantiza que el total cuadre al centavo.
+        total += product.price * item.quantity
+
+    order = Order(
+        user_id=user_id,
+        reference="",  # se completa abajo, una vez que ya existe el id
+        status=estado_inicial,
+        payment_method=payment_method,
+        total_amount=total,
+        items=order_items,
+    )
+    db.add(order)
+    db.commit()
+    db.refresh(order)
+
+    order.reference = _generate_reference(order.id)
+
+    # Contra entrega: la compra queda cerrada acá mismo, no hay pasarela
+    # que esperar. Si el carrito siguiera lleno, la clienta lo vería con
+    # los productos que acaba de comprar y podría pedirlos otra vez sin
+    # darse cuenta. Con Wompi el carrito se limpia recién al aprobarse el
+    # pago (ver process_wompi_transaction), porque hasta entonces la
+    # compra todavía se puede caer.
+    if payment_method in CONTRA_ENTREGA:
+        cart_repository.delete_for_user_and_products(
+            db, user_id, [item.product_id for item in order.items]
+        )
+
+    db.commit()
+    db.refresh(order)
+    return order
+
+
+def build_checkout_payload(order: Order) -> dict:
+    """Lo que el frontend necesita para cerrar el pedido.
+
+    Contra entrega no tiene widget: se devuelve el sobre sin `public_key`
+    ni `signature`, y el frontend muestra las instrucciones de pago.
+    Con Wompi (oculto, no se usa) irían los datos del widget.
+    """
+    amount_in_cents = to_cents(order.total_amount)
+    currency = settings.WOMPI_CURRENCY
+
+    base = {
+        "order_id": order.id,
+        "payment_method": order.payment_method,
+        "currency": currency,
+        "amount_in_cents": amount_in_cents,
+        "reference": order.reference,
+    }
+
+    if order.payment_method in CONTRA_ENTREGA:
+        return {**base, "public_key": None, "signature": None}
+
+    if not settings.WOMPI_PUBLIC_KEY:
+        raise WompiNotConfiguredError("Falta configurar WOMPI_PUBLIC_KEY.")
+
+    return {
+        **base,
+        "public_key": settings.WOMPI_PUBLIC_KEY,
+        "signature": _sign(order.reference, amount_in_cents, currency),
+    }
+
+
+def get_order_or_raise(db: Session, order_id: int, *, user_id: int | None = None) -> Order:
+    order = db.query(Order).filter(Order.id == order_id).first()
+    if order is None or (user_id is not None and order.user_id != user_id):
+        raise OrderNotFoundError(f"Pedido {order_id} no encontrado.")
+    return order
+
+
+def _get_order_for_update(db: Session, order_id: int, *, user_id: int | None = None) -> Order:
+    """Igual que get_order_or_raise, pero bloqueando la fila del pedido
+    (SELECT ... FOR UPDATE). Se usa cuando dos cosas podrían intentar
+    cambiar el estado del mismo pedido casi al mismo tiempo."""
+    order = db.query(Order).filter(Order.id == order_id).with_for_update().first()
+    if order is None or (user_id is not None and order.user_id != user_id):
+        raise OrderNotFoundError(f"Pedido {order_id} no encontrado.")
+    return order
+
+
+# Estados desde los que el cliente todavía puede cancelar solo.
+_CANCELABLE_STATUSES = {OrderStatus.PENDING, OrderStatus.CONFIRMED}
+
+
+def cancel_order(db: Session, order_id: int, user_id: int) -> Order:
+    """El CLIENTE cancela su propio pedido, mientras siga PENDING o
+    CONFIRMED (antes de que salga a entregar).
+
+    No se puede cancelar:
+    - un pedido de otra persona (se valida el dueño)
+    - un pedido que ya no está PENDING/CONFIRMED (ya va en camino, ya se
+      pagó, se rechazó, expiró, o ya se había cancelado)
+    """
+    order = _get_order_for_update(db, order_id, user_id=user_id)
+
+    # CONFIRMED entra acá: un contra entrega que todavía no salió a
+    # repartir se puede cancelar igual que uno sin pagar. Desde
+    # IN_TRANSIT ya no: la dueña ya salió con el producto.
+    if order.status not in _CANCELABLE_STATUSES:
+        raise InvalidStatusTransitionError(
+            "Este pedido ya no se puede cancelar (ya va en camino, ya fue "
+            "pagado, rechazado, expiró, o ya estaba cancelado)."
+        )
+
+    order.status = OrderStatus.CANCELLED
+    db.commit()
+    db.refresh(order)
+    return order
+
+
+# Estados desde los que un pedido existente todavía se puede pagar.
+_RETRYABLE_STATUSES = {OrderStatus.PENDING, OrderStatus.DECLINED, OrderStatus.ERROR}
+
+
+def get_checkout_payload_for_order(db: Session, order_id: int, user_id: int) -> dict:
+    """Para el botón "Pagar" en un pedido YA creado (no pasa por el
+    carrito). Genera una referencia NUEVA cada vez — Wompi no deja
+    reusar una referencia ya usada, ni siquiera de un intento fallido.
+
+    En SeizeMB el método activo es contra entrega: este camino solo
+    aplica si algún día se reactiva Wompi.
+    """
+    order = _get_order_for_update(db, order_id, user_id=user_id)
+
+    # Un pedido contra entrega no se paga por la pasarela: no tiene nada
+    # que cobrar en línea. Sin esta guarda se le armaría un checkout de
+    # Wompi y el cliente terminaría pagando dos veces — una en la app y
+    # otra en la mano de quien se lo entrega.
+    if order.payment_method != PaymentMethod.WOMPI:
+        raise InvalidStatusTransitionError(
+            "Este pedido se paga al recibirlo, no por la pasarela."
+        )
+
+    if order.status not in _RETRYABLE_STATUSES:
+        raise InvalidStatusTransitionError(
+            "Este pedido ya no se puede pagar. Si todavía quieres estos "
+            "productos, arma un pedido nuevo desde el carrito."
+        )
+
+    if order.status in (OrderStatus.DECLINED, OrderStatus.ERROR):
+        for item in order.items:
+            product = product_repository.get_by_id(db, item.product_id)
+            if product is None or not product.in_stock:
+                name = product.name if product else f"#{item.product_id}"
+                raise ProductUnavailableError(
+                    f"'{name}' ya no está disponible para reintentar este pedido."
+                )
+        order.status = OrderStatus.PENDING
+
+    order.reference = _generate_reference(order.id)
+    db.commit()
+    db.refresh(order)
+
+    return build_checkout_payload(order)
+
+
+def list_my_orders(db: Session, user_id: int, stage: str | None = None) -> list[Order]:
+    expire_stale_orders(db)
+    query = db.query(Order).filter(Order.user_id == user_id)
+    if stage == "active":
+        query = query.filter(Order.status.in_(ACTIVE_ORDER_STATUSES))
+    elif stage == "completed":
+        query = query.filter(Order.status.in_(COMPLETED_ORDER_STATUSES))
+    return query.order_by(Order.created_at.desc()).all()
+
+
+def list_all_orders(
+    db: Session,
+    skip: int = 0,
+    limit: int = 100,
+    status: OrderStatus | None = None,
+) -> list[Order]:
+    expire_stale_orders(db)
+    query = db.query(Order)
+    if status is not None:
+        query = query.filter(Order.status == status)
+    return query.order_by(Order.created_at.desc()).offset(skip).limit(limit).all()
+
+
+def update_delivery_status(db: Session, order_id: int, new_status: OrderStatus) -> Order:
+    """Transiciones de logística que dispara la dueña desde el panel.
+
+    Nunca permite saltos: para llegar a DELIVERED hay que haber pasado
+    por AWAITING_CONFIRMATION, o sea haber declarado antes que se entregó
+    y se cobró.
+
+    Que la dueña pueda cerrar el pedido ella misma es a propósito, pero
+    tiene un costo que conviene tener presente: la confirmación de la
+    clienta deja de ser necesaria para cerrar. Sirve para que un pedido
+    no quede abierto para siempre porque alguien no volvió a la app; no
+    sirve como prueba de que la clienta estuvo de acuerdo."""
+    order = get_order_or_raise(db, order_id)
+    allowed = _DELIVERY_TRANSITIONS.get(order.status, set())
+    if new_status not in allowed:
+        raise InvalidStatusTransitionError(
+            f"No se puede pasar de {order.status.value} a {new_status.value}."
+        )
+    order.status = new_status
+    if new_status == OrderStatus.DELIVERED:
+        # Lo cierra la tienda: la clienta nunca confirmó. Queda anotado
+        # para que después nadie tenga que adivinar si hubo acuerdo.
+        order.delivery_confirmed_at = datetime.now(timezone.utc)
+        order.closed_by = ClosedBy.SELLER
+    if new_status == OrderStatus.AWAITING_CONFIRMATION:
+        ahora = datetime.now(timezone.utc)
+        order.delivered_at = ahora
+        # En contra entrega, este es el momento en que la dueña dice
+        # "entregué Y me pagaron": recién acá la plata existe. Con Wompi
+        # ya se había marcado al aprobarse el pago, y no se pisa.
+        if order.payment_method in CONTRA_ENTREGA and order.paid_at is None:
+            order.paid_at = ahora
+    db.commit()
+    db.refresh(order)
+    return order
+
+
+def confirm_delivery(db: Session, order_id: int, user_id: int) -> Order:
+    """El CLIENTE confirma que ya recibió su pedido. Solo el dueño del
+    pedido puede hacerlo, y solo si está en AWAITING_CONFIRMATION."""
+    order = get_order_or_raise(db, order_id, user_id=user_id)
+    if order.status != OrderStatus.AWAITING_CONFIRMATION:
+        raise InvalidStatusTransitionError(
+            "Este pedido no está esperando tu confirmación de entrega."
+        )
+    order.status = OrderStatus.DELIVERED
+    order.delivery_confirmed_at = datetime.now(timezone.utc)
+    order.closed_by = ClosedBy.CUSTOMER
+    db.commit()
+    db.refresh(order)
+    return order
+
+
+def _validate_event_matches_order(
+    db: Session,
+    order: Order,
+    *,
+    wompi_transaction_id: str,
+    amount_in_cents: int | None,
+    currency: str | None,
+) -> None:
+    """La firma de Wompi solo cubre `transaction.id`, `transaction.status`
+    y `transaction.amount_in_cents` — la `reference` NO va firmada. O sea
+    que un evento legítimo de una compra barata sigue teniendo un checksum
+    válido si alguien le cambia la referencia por la de un pedido caro, y
+    ese pedido quedaría pago sin haberse cobrado.
+
+    Por eso, además de la firma, el evento tiene que cuadrar con el
+    pedido: mismo monto, misma moneda, y una transacción que no se haya
+    usado ya para otro pedido.
+    """
+    if amount_in_cents is not None and amount_in_cents != to_cents(order.total_amount):
+        raise WompiEventMismatchError(
+            f"El evento cobra {amount_in_cents} centavos y el pedido {order.id} "
+            f"vale {to_cents(order.total_amount)}."
+        )
+
+    if currency is not None and currency.upper() != settings.WOMPI_CURRENCY.upper():
+        raise WompiEventMismatchError(
+            f"El evento viene en {currency} y la tienda cobra en {settings.WOMPI_CURRENCY}."
+        )
+
+    ya_usada = (
+        db.query(Order.id)
+        .filter(
+            Order.wompi_transaction_id == wompi_transaction_id,
+            Order.id != order.id,
+        )
+        .first()
+    )
+    if ya_usada is not None:
+        raise WompiEventMismatchError(
+            f"La transacción {wompi_transaction_id} ya se aplicó al pedido {ya_usada[0]}."
+        )
+
+
+def process_wompi_transaction(
+    db: Session,
+    *,
+    reference: str,
+    wompi_status: str,
+    wompi_transaction_id: str,
+    amount_in_cents: int | None = None,
+    currency: str | None = None,
+) -> Order | None:
+    """Procesa un evento `transaction.updated` YA VERIFICADO (firma
+    correcta) que llega del webhook de Wompi.
+
+    Wompi está oculto en SeizeMB. Este camino se deja por si se reactiva.
+    Es idempotente: si Wompi reintenta el mismo evento, no pisa un estado
+    de logística ya avanzado. Devuelve None si no existe ningún pedido
+    con esa referencia, y lanza WompiEventMismatchError si el evento no
+    cuadra con el pedido.
+    """
+    order = db.query(Order).filter(Order.reference == reference).with_for_update().first()
+    if order is None:
+        return None
+
+    if wompi_status not in _WOMPI_TERMINAL_STATUSES:
+        # Estados intermedios (ej. "PENDING" del lado de Wompi): no hay
+        # nada que hacer todavía, esperamos el evento final.
+        return order
+
+    _validate_event_matches_order(
+        db,
+        order,
+        wompi_transaction_id=wompi_transaction_id,
+        amount_in_cents=amount_in_cents,
+        currency=currency,
+    )
+
+    new_status = OrderStatus(wompi_status)
+
+    if order.status != OrderStatus.PENDING:
+        if order.wompi_transaction_id != wompi_transaction_id:
+            logger.warning(
+                "Evento de Wompi para pedido %s (status=%s) llegó cuando "
+                "el pedido ya estaba en %s. Se ignora.",
+                order.id, wompi_status, order.status.value,
+            )
+        return order
+
+    if new_status == OrderStatus.APPROVED:
+        product_ids = [item.product_id for item in order.items]
+        cart_repository.delete_for_user_and_products(db, order.user_id, product_ids)
+        # Con Wompi la plata entra al aprobarse, antes de entregar nada.
+        order.paid_at = datetime.now(timezone.utc)
+    else:
+        # DECLINED / VOIDED / ERROR: el pago no se completó.
+        order.paid_at = None
+
+    order.status = new_status
+    order.wompi_transaction_id = wompi_transaction_id
+    db.commit()
+    db.refresh(order)
+    return order
+
+
+# Cómo se le explica cada estado a la dueña, que no sabe ni quiere saber
+# los nombres internos.
+_ESTADO_EN_CRISTIANO = {
+    OrderStatus.CONFIRMED: "confirmado, sin entregar",
+    OrderStatus.APPROVED: "pagado",
+    OrderStatus.IN_TRANSIT: "en camino",
+    OrderStatus.AWAITING_CONFIRMATION: "entregado, esperando confirmación",
+    OrderStatus.DELIVERED: "entregado",
+}
+
+
+def orders_blocking_product(db: Session, product_id: int) -> list[Order]:
+    """Los pedidos vivos que incluyen este producto y por eso impiden
+    borrarlo.
+
+    Existe para poder DECIR cuáles son. Antes se intentaba borrar y, si la
+    base se quejaba, se asumía que eran ventas — pero desde que hay contra
+    entrega un pedido apenas CONFIRMED (que no cobró nada y no expira
+    nunca) también bloquea, y el mensaje culpaba a ventas inexistentes.
+    """
+    return (
+        db.query(Order)
+        .join(OrderItem, OrderItem.order_id == Order.id)
+        .filter(
+            OrderItem.product_id == product_id,
+            Order.status.in_(COMMITTED_ORDER_STATUSES),
+        )
+        .order_by(Order.id)
+        .all()
+    )
+
+
+def describe_blocking_orders(db: Session, product_id: int) -> str:
+    """Los pedidos que bloquean, en palabras. Cadena vacía si no hay."""
+    pedidos = orders_blocking_product(db, product_id)
+    if not pedidos:
+        return ""
+    return ", ".join(
+        f"#{pedido.id} ({_ESTADO_EN_CRISTIANO.get(pedido.status, pedido.status.value)})"
+        for pedido in pedidos
+    )
+
+
+def clear_non_approved_references(db: Session, product_id: int) -> None:
+    """Borra las referencias a este producto en pedidos que NO son ventas
+    reales (todo lo que no esté en COMMITTED_ORDER_STATUSES). Se usa antes de
+    eliminar un producto: las ventas reales (pagadas, sin importar si ya
+    se entregaron o siguen en camino) se dejan intactas a propósito, son
+    historial y no se tocan nunca."""
+    non_sale_order_ids = [
+        row[0]
+        for row in db.query(Order.id).filter(Order.status.not_in(COMMITTED_ORDER_STATUSES)).all()
+    ]
+    if not non_sale_order_ids:
+        return
+    db.query(OrderItem).filter(
+        OrderItem.product_id == product_id,
+        OrderItem.order_id.in_(non_sale_order_ids),
+    ).delete(synchronize_session=False)
+    db.commit()
