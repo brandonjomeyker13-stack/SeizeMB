@@ -55,6 +55,7 @@ class UserRead(UserBase):
     id: int
     address: str | None = None
     city: str | None = None
+    phone: str | None = None
     is_active: bool
     is_admin: bool
     accepted_terms: bool

@@ -4,6 +4,7 @@ __pycache__/
 .venv/
 venv/
 .env
+render.env
 *.db
 *.sqlite3
 .pytest_cache/

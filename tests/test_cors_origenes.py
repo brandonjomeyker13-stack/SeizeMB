@@ -59,6 +59,12 @@ def test_localhost_siempre_es_de_confianza(cors_con, origen):
     assert cors.is_trusted_origin(origen)
 
 
+def test_el_preview_de_lovable_siempre_es_de_confianza(cors_con):
+    cors = cors_con(environment="production", allow_preview=False)
+
+    assert cors.is_trusted_origin("https://compra-y-vende-market.lovable.app")
+
+
 def test_un_dominio_extra_del_env_es_de_confianza(cors_con):
     cors = cors_con(
         environment="production",

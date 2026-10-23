@@ -23,7 +23,15 @@ _LOCAL_ORIGINS = [
     "http://127.0.0.1:5173",
 ]
 
-ALLOWED_ORIGINS = list(dict.fromkeys(_LOCAL_ORIGINS + settings.extra_frontend_origins))
+# Preview actual de Lovable. Va fijo (no por el comodín *.lovable.app)
+# para no abrir /auth/refresh a cualquier proyecto ajeno.
+_KNOWN_FRONTENDS = [
+    "https://compra-y-vende-market.lovable.app",
+]
+
+ALLOWED_ORIGINS = list(
+    dict.fromkeys(_LOCAL_ORIGINS + _KNOWN_FRONTENDS + settings.extra_frontend_origins)
+)
 
 # El subdominio de preview de Lovable cambia por proyecto/sesión, así que
 # no se puede listar: hay que aceptarlo por patrón o no aceptarlo.

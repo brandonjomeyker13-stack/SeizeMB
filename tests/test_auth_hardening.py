@@ -54,7 +54,12 @@ def test_logout_desde_un_sitio_ajeno_no_cierra_la_sesion(client, crear_usuario):
 
 @pytest.mark.parametrize(
     "origin",
-    ["http://localhost:5173", "http://localhost:3000", "http://127.0.0.1:5173"],
+    [
+        "http://localhost:5173",
+        "http://localhost:3000",
+        "http://127.0.0.1:5173",
+        "https://compra-y-vende-market.lovable.app",
+    ],
 )
 def test_el_frontend_de_verdad_si_puede_refrescar(client, crear_usuario, origin):
     usuario = crear_usuario(email=f"ok{hash(origin)}@pruebas.tienda.co", password="Clave-1234")
