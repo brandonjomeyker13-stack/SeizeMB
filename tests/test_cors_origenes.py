@@ -59,10 +59,17 @@ def test_localhost_siempre_es_de_confianza(cors_con, origen):
     assert cors.is_trusted_origin(origen)
 
 
-def test_el_preview_de_lovable_siempre_es_de_confianza(cors_con):
+@pytest.mark.parametrize(
+    "origen",
+    [
+        "https://compra-y-vende-market.lovable.app",
+        "https://compra-y-vende-market.vercel.app",
+    ],
+)
+def test_el_front_conocido_siempre_es_de_confianza(cors_con, origen):
     cors = cors_con(environment="production", allow_preview=False)
 
-    assert cors.is_trusted_origin("https://compra-y-vende-market.lovable.app")
+    assert cors.is_trusted_origin(origen)
 
 
 def test_un_dominio_extra_del_env_es_de_confianza(cors_con):
@@ -104,6 +111,7 @@ def test_se_puede_reabrir_a_mano_mientras_se_construye(cors_con):
         "https://seizemb.com:8443",
         "http://seizemb.com",
         "https://lovable.app.atacante.com",
+        "https://otro-proyecto.vercel.app",
         "https://sitio-cualquiera.com",
     ],
 )

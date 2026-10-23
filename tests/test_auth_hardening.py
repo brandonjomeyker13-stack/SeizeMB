@@ -59,6 +59,7 @@ def test_logout_desde_un_sitio_ajeno_no_cierra_la_sesion(client, crear_usuario):
         "http://localhost:3000",
         "http://127.0.0.1:5173",
         "https://compra-y-vende-market.lovable.app",
+        "https://compra-y-vende-market.vercel.app",
     ],
 )
 def test_el_frontend_de_verdad_si_puede_refrescar(client, crear_usuario, origin):

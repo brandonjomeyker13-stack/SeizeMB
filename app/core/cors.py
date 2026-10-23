@@ -23,10 +23,11 @@ _LOCAL_ORIGINS = [
     "http://127.0.0.1:5173",
 ]
 
-# Preview actual de Lovable. Va fijo (no por el comodín *.lovable.app)
+# Fronts de producción. Van fijos (no por comodín *.lovable.app / *.vercel.app)
 # para no abrir /auth/refresh a cualquier proyecto ajeno.
 _KNOWN_FRONTENDS = [
     "https://compra-y-vende-market.lovable.app",
+    "https://compra-y-vende-market.vercel.app",
 ]
 
 ALLOWED_ORIGINS = list(
