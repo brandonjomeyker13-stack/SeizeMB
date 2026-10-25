@@ -1,5 +1,6 @@
 """Acceso a datos de Product. Solo queries, sin reglas de negocio."""
 
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.models.product import Product
@@ -20,6 +21,15 @@ def get_by_id_for_update(db: Session, product_id: int) -> Product | None:
         db.query(Product)
         .filter(Product.id == product_id)
         .with_for_update()
+        .first()
+    )
+
+
+def get_by_name_ci(db: Session, name: str) -> Product | None:
+    """Para no duplicar un producto si se importa el mismo JSON otra vez."""
+    return (
+        db.query(Product)
+        .filter(func.lower(Product.name) == name.strip().lower())
         .first()
     )
 

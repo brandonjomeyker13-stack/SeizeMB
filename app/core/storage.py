@@ -120,26 +120,15 @@ class UploadedImage(NamedTuple):
     path: str
 
 
-async def upload_product_image(file: UploadFile, product_id: int) -> UploadedImage:
-    """Sube la imagen al bucket y devuelve su URL pública y su ruta."""
-
-    # Chequeo rápido del header como primer filtro (no es la validación
-    # real, solo evita leer el archivo completo si viene claramente mal).
-    if file.content_type not in ALLOWED_CONTENT_TYPES:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Solo se permiten imágenes JPG, PNG o WEBP.",
-        )
-
-    contents = await file.read()
+def upload_product_image_bytes(contents: bytes, product_id: int) -> UploadedImage:
+    """Sube bytes ya leídos al bucket. Lo usa la subida del admin y el
+    importador (que baja la foto de otra tienda y la vuelve a guardar)."""
     if len(contents) > MAX_FILE_SIZE_BYTES:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="La imagen no puede pesar más de 5 MB.",
         )
 
-    # Validación REAL: los bytes tienen que coincidir con la firma binaria
-    # del formato, sin importar lo que diga el Content-Type del header.
     real_content_type = _detect_real_content_type(contents)
     if real_content_type is None or real_content_type not in ALLOWED_CONTENT_TYPES:
         raise HTTPException(
@@ -150,7 +139,6 @@ async def upload_product_image(file: UploadFile, product_id: int) -> UploadedIma
     extension = {"image/png": "png", "image/jpeg": "jpg", "image/webp": "webp"}[
         real_content_type
     ]
-    # Nombre único por producto para evitar sobrescribir el archivo anterior.
     path = f"product-{product_id}-{uuid.uuid4().hex}.{extension}"
 
     client = _get_client()
@@ -159,8 +147,6 @@ async def upload_product_image(file: UploadFile, product_id: int) -> UploadedIma
             path, contents, {"content-type": real_content_type}
         )
     except StorageApiError as exc:
-        # El detalle completo va a los logs; al admin le llega la versión
-        # traducida de _traducir_error_de_storage.
         logger.error(
             "Supabase rechazó la subida al bucket %s: status=%s code=%s %s",
             BUCKET_NAME,
@@ -174,6 +160,20 @@ async def upload_product_image(file: UploadFile, product_id: int) -> UploadedIma
         url=client.storage.from_(BUCKET_NAME).get_public_url(path),
         path=path,
     )
+
+
+async def upload_product_image(file: UploadFile, product_id: int) -> UploadedImage:
+    """Sube la imagen al bucket y devuelve su URL pública y su ruta."""
+
+    # Chequeo rápido del header como primer filtro (no es la validación
+    # real, solo evita leer el archivo completo si viene claramente mal).
+    if file.content_type not in ALLOWED_CONTENT_TYPES:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Solo se permiten imágenes JPG, PNG o WEBP.",
+        )
+
+    return upload_product_image_bytes(await file.read(), product_id)
 
 
 def delete_product_image_file(storage_path: str) -> None:

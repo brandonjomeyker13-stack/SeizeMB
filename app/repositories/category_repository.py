@@ -15,6 +15,16 @@ def get_by_name(db: Session, name: str) -> Category | None:
     return db.query(Category).filter(Category.name == name).first()
 
 
+def get_by_name_ci(db: Session, name: str) -> Category | None:
+    """Busca por nombre sin importar mayúsculas: 'Morrales' y 'morrales'
+    son la misma categoría al importar un catálogo."""
+    return (
+        db.query(Category)
+        .filter(func.lower(Category.name) == name.strip().lower())
+        .first()
+    )
+
+
 def list_all(db: Session) -> list[Category]:
     return db.query(Category).order_by(Category.name).all()
 

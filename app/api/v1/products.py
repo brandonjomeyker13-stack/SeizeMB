@@ -8,6 +8,7 @@ from app.db.session import get_db
 from app.models.color import Color, listar_catalogo
 from app.models.product_image import ProductImage
 from app.models.user import User
+from app.schemas.catalog_import import CatalogImport, CatalogImportResult
 from app.schemas.product import (
     ProductAdminRead,
     ProductColorsUpdate,
@@ -15,7 +16,7 @@ from app.schemas.product import (
     ProductRead,
     ProductUpdate,
 )
-from app.services import product_service
+from app.services import catalog_import_service, product_service
 
 router = APIRouter()
 
@@ -48,6 +49,27 @@ def list_colors():
     paleta a mano y arriesgarse a que se separen.
     """
     return listar_catalogo()
+
+
+@router.post("/import", response_model=CatalogImportResult)
+def import_catalog(
+    payload: CatalogImport,
+    db: Session = Depends(get_db),
+    is_admin: User = Depends(get_current_admin_user),
+):
+    """Recibe el JSON de GET /products/export de otra tienda.
+
+    Baja cada foto y la vuelve a subir al Storage de SeizeMB. No se
+    reutiliza la URL de origen: después el otro proyecto puede apagarse.
+
+    Va antes de /{product_id} para que FastAPI no lea "import" como id.
+    """
+    if not payload.products and not payload.categories:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="El archivo no trae categorías ni productos.",
+        )
+    return catalog_import_service.import_catalog(db, payload)
 
 
 @router.get("/{product_id}", response_model=ProductRead)
