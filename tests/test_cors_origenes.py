@@ -64,6 +64,7 @@ def test_localhost_siempre_es_de_confianza(cors_con, origen):
     [
         "https://compra-y-vende-market.lovable.app",
         "https://compra-y-vende-market.vercel.app",
+        "https://seizemb-orderscode.vercel.app",
     ],
 )
 def test_el_front_conocido_siempre_es_de_confianza(cors_con, origen):

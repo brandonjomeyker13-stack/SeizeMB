@@ -28,6 +28,7 @@ _LOCAL_ORIGINS = [
 _KNOWN_FRONTENDS = [
     "https://compra-y-vende-market.lovable.app",
     "https://compra-y-vende-market.vercel.app",
+    "https://seizemb-orderscode.vercel.app",
 ]
 
 ALLOWED_ORIGINS = list(
