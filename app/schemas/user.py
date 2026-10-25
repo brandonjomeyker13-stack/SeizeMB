@@ -59,5 +59,14 @@ class UserRead(UserBase):
     is_active: bool
     is_admin: bool
     accepted_terms: bool
+    # False = cuenta solo con Google; el perfil le deja crear una clave.
+    has_password: bool = False
 
     model_config = ConfigDict(from_attributes=True)
+
+
+class GoogleAuthResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    # True solo si se acaba de crear la cuenta (primera vez con Google).
+    is_new: bool = False

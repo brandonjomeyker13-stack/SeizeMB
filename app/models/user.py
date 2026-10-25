@@ -44,3 +44,8 @@ class User(Base):
     cart_items = relationship(
         "CartItem", back_populates="user", cascade="all, delete-orphan"
     )
+
+    @property
+    def has_password(self) -> bool:
+        """Si es False, se registró solo con Google y aún no creó clave."""
+        return self.password_hash is not None

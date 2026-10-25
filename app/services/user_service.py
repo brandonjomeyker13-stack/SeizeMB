@@ -65,49 +65,47 @@ def authenticate_google(
     name: str,
     accepted_terms: bool,
     password: str | None = None,
-) -> User:
+) -> tuple[User, bool]:
+    """Devuelve (usuario, es_nuevo).
+
+    Google no exige contraseña. Si quiere una de respaldo, la crea después
+    en el perfil. `password` se ignora a propósito: ya no se pide al
+    registrarse.
+    """
+    _ = password
     existing_by_google = user_repository.get_by_google_id(db, google_id)
     if existing_by_google is not None:
         if not existing_by_google.is_active:
             raise InvalidCredentialsError("El usuario está inactivo.")
-        return existing_by_google
+        return existing_by_google, False
 
     existing_by_email = user_repository.get_by_email(db, email)
     if existing_by_email is not None:
         if existing_by_email.google_id is not None and existing_by_email.google_id != google_id:
-            # Caso raro: el email ya está vinculado a OTRA cuenta de
-            # Google distinta. Esto no debería pasar en flujo normal.
             raise GoogleAccountConflictError(
                 "Este email ya está vinculado a otra cuenta de Google."
             )
         logger.info(
-            "Vinculando Google a cuenta existente por email (user_id=%s); "
-            "se invalida su contraseña anterior por seguridad.",
+            "Vinculando Google a cuenta existente por email (user_id=%s).",
             existing_by_email.id,
         )
-        return user_repository.link_google_and_clear_password(
-            db, existing_by_email, google_id
-        )
+        return user_repository.set_google_id(db, existing_by_email, google_id), False
 
     if not accepted_terms:
         raise TermsNotAcceptedError(
-            "Debes aceptar los Términos y Condiciones y la Política de "
-            "Tratamiento de Datos para registrarte."
+            "Aún no tienes cuenta. Ve a Registrarme, acepta los términos "
+            "y entra con Google. No necesitas contraseña."
         )
 
-    # Cuenta nueva creada por Google: si el frontend manda una contraseña
-    # (se le pide UNA sola vez, en este primer registro), la guardamos
-    # para que de ahí en adelante también pueda entrar con email+contraseña
-    # sin que se la vuelvan a pedir.
-    password_hash = hash_password(password) if password else None
-    return user_repository.create_google_user(
+    user = user_repository.create_google_user(
         db,
         name=name,
         email=email,
         google_id=google_id,
-        password_hash=password_hash,
+        password_hash=None,
         accepted_terms=accepted_terms,
     )
+    return user, True
 
 
 def link_google_account(db: Session, *, user: User, email: str, google_id: str) -> User:

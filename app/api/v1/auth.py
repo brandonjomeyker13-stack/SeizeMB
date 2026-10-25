@@ -13,6 +13,7 @@ from app.db.session import get_db
 from app.models.user import User
 from app.schemas.user import (
     GoogleAuthRequest,
+    GoogleAuthResponse,
     GoogleLinkRequest,
     SetPasswordRequest,
     UserCreate,
@@ -64,7 +65,7 @@ def login(
     return {"access_token": access_token, "token_type": "bearer"}
 
 
-@router.post("/google")
+@router.post("/google", response_model=GoogleAuthResponse)
 @limiter.limit("10/minute")
 def login_with_google(
     request: Request,
@@ -85,7 +86,7 @@ def login_with_google(
     name = claims.get("name") or email.split("@")[0]
 
     try:
-        user = user_service.authenticate_google(
+        user, is_new = user_service.authenticate_google(
             db,
             email=email,
             google_id=google_id,
@@ -102,7 +103,7 @@ def login_with_google(
 
     access_token, raw_refresh, max_age = auth_service.issue_tokens(db, user_id=user.id)
     response.set_cookie(value=raw_refresh, **refresh_cookie_kwargs(max_age_seconds=max_age))
-    return {"access_token": access_token, "token_type": "bearer"}
+    return GoogleAuthResponse(access_token=access_token, is_new=is_new)
 
 
 @router.post("/google/link", response_model=UserRead)
