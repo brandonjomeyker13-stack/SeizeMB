@@ -5,8 +5,10 @@ import logging
 from sqlalchemy.orm import Session
 
 from app.core.security import hash_password, verify_password
+from app.models.cart import CartItem
+from app.models.order import ACTIVE_ORDER_STATUSES, Order
 from app.models.user import User
-from app.repositories import user_repository
+from app.repositories import refresh_token_repository, user_repository
 
 logger = logging.getLogger("seizemb.users")
 
@@ -24,6 +26,14 @@ class GoogleAccountConflictError(Exception):
 
 
 class TermsNotAcceptedError(Exception):
+    pass
+
+
+class OpenOrdersBlockDeletionError(Exception):
+    pass
+
+
+class AdminAccountError(Exception):
     pass
 
 
@@ -167,4 +177,28 @@ def set_password(db: Session, *, user: User, current_password: str | None, new_p
 
 
 def delete_account(db: Session, *, user: User) -> None:
-    user_repository.delete(db, user)
+    """Quita los datos personales. No borra la fila si ya hay pedidos:
+    el número de pedido se conserva, sin nombre, correo ni dirección.
+    """
+    if user.is_admin:
+        raise AdminAccountError("La cuenta de la tienda no se borra desde el perfil.")
+    abiertos = (
+        db.query(Order.id)
+        .filter(Order.user_id == user.id, Order.status.in_(tuple(ACTIVE_ORDER_STATUSES)))
+        .count()
+    )
+    if abiertos:
+        raise OpenOrdersBlockDeletionError(
+            "Tienes un pedido en curso. Cancélalo o espera a que se entregue antes de borrar tus datos."
+        )
+    db.query(CartItem).filter(CartItem.user_id == user.id).delete(synchronize_session=False)
+    refresh_token_repository.revoke_all_for_user(db, user.id)
+    user.name = "Cuenta eliminada"
+    user.email = f"eliminada-{user.id}@invalid.seizemb"
+    user.address = None
+    user.city = None
+    user.phone = None
+    user.password_hash = None
+    user.google_id = None
+    user.is_active = False
+    db.commit()

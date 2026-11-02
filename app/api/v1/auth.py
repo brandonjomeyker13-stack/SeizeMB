@@ -229,6 +229,10 @@ def update_my_profile(
 def delete_my_account(
     current_user: User = Depends(get_current_user), db: Session = Depends(get_db)
 ):
-    """Derecho de supresión: el usuario puede pedir que borremos su cuenta.
-    Los ítems de carrito se borran en cascada (ver relationship en User)."""
-    user_service.delete_account(db, user=current_user)
+    """Derecho de supresión: quita los datos personales de la cuenta."""
+    try:
+        user_service.delete_account(db, user=current_user)
+    except user_service.OpenOrdersBlockDeletionError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+    except user_service.AdminAccountError as exc:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc)) from exc
