@@ -9,6 +9,7 @@ mezcles con este archivo).
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse
 from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 
@@ -66,9 +67,23 @@ app.include_router(webhooks.router, prefix="/api/v1/webhooks", tags=["webhooks"]
 app.include_router(sales.router, prefix="/api/v1/sales", tags=["sales"])
 
 
-@app.get("/")
+# Google Search Console busca esta etiqueta en el HTML de la página de
+# inicio del dominio que se verifica. /health sigue en JSON para monitores.
+_GOOGLE_SITE_VERIFICATION = "SzdNS0Niw2K97d-Q0aNWLM37x8_mmP2bifsOpBP8AyU"
+
+
+@app.get("/", response_class=HTMLResponse)
 def root():
-    return {"message": "SeizeMB API está corriendo"}
+    return f"""<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8" />
+<meta name="google-site-verification" content="{_GOOGLE_SITE_VERIFICATION}" />
+<meta name="robots" content="noindex" />
+<title>SeizeMB API</title>
+</head>
+<body>SeizeMB API está corriendo</body>
+</html>"""
 
 
 @app.get("/health")

@@ -17,8 +17,8 @@ services:
 
     # Render da por vivo el servicio cuando esta ruta responde 200. Sin
     # esto solo revisa que el puerto este abierto, y un arranque que
-    # falla a medias podria darse por bueno. GET / devuelve el mensaje
-    # de "la API esta corriendo" (app/main_app.py).
+    # falla a medias podria darse por bueno. GET / responde 200 con el
+    # mensaje de "la API esta corriendo" (app/main_app.py).
     healthCheckPath: /
 
     # Esperar a que GitHub Actions termine en verde antes de desplegar.
