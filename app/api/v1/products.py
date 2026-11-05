@@ -1,14 +1,16 @@
 """ endpoints del producto"""
-from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, UploadFile, status
 from sqlalchemy.orm import Session
 
-from app.api.deps import get_current_admin_user
+from app.api.deps import get_current_admin_user, get_current_user
+from app.core.limiter import limiter
 from app.core.storage import delete_product_image_file, upload_product_image
 from app.db.session import get_db
 from app.models.color import Color, listar_catalogo
 from app.models.product_image import ProductImage
 from app.models.user import User
 from app.schemas.catalog_import import CatalogImport, CatalogImportResult
+from app.schemas.rating import MyRating, RatingPublic, RatingWrite
 from app.schemas.product import (
     ProductAdminRead,
     ProductColorsUpdate,
@@ -16,7 +18,7 @@ from app.schemas.product import (
     ProductRead,
     ProductUpdate,
 )
-from app.services import catalog_import_service, product_service
+from app.services import catalog_import_service, product_service, rating_service
 
 router = APIRouter()
 
@@ -32,8 +34,9 @@ def list_products(
     category_id: int | None = Query(default=None),
     db: Session = Depends(get_db),
 ):
-    return product_service.list_products(
-        db, skip=skip, limit=limit, category_id=category_id
+    return rating_service.attach(
+        db,
+        product_service.list_products(db, skip=skip, limit=limit, category_id=category_id),
     )
 
 
@@ -75,9 +78,57 @@ def import_catalog(
 @router.get("/{product_id}", response_model=ProductRead)
 def get_product(product_id: int, db: Session = Depends(get_db)):
     try:
-        return product_service.get_product_or_raise(db, product_id)
+        return rating_service.attach(db, [product_service.get_product_or_raise(db, product_id)])[0]
     except product_service.ProductNotFoundError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+
+
+@router.get("/{product_id}/ratings", response_model=list[RatingPublic])
+def list_ratings(product_id: int, db: Session = Depends(get_db)):
+    try:
+        product_service.get_product_or_raise(db, product_id)
+    except product_service.ProductNotFoundError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    return rating_service.public_list(db, product_id)
+
+
+@router.get("/{product_id}/rating", response_model=MyRating)
+def my_rating(
+    product_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    row = rating_service.mine(db, user_id=current_user.id, product_id=product_id)
+    return MyRating(
+        can_rate=rating_service.received(db, user_id=current_user.id, product_id=product_id),
+        stars=row.stars if row else None,
+        comment=row.comment if row else None,
+    )
+
+
+@router.post("/{product_id}/rating", response_model=MyRating)
+@limiter.limit("10/minute")
+def rate_product(
+    request: Request,
+    product_id: int,
+    payload: RatingWrite,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    try:
+        product_service.get_product_or_raise(db, product_id)
+        row = rating_service.rate(
+            db,
+            user=current_user,
+            product_id=product_id,
+            stars=payload.stars,
+            comment=payload.comment,
+        )
+    except product_service.ProductNotFoundError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    except rating_service.ProductNotDeliveredError as exc:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc)) from exc
+    return MyRating(can_rate=True, stars=row.stars, comment=row.comment)
 
 
 @router.get("/{product_id}/admin", response_model=ProductAdminRead)

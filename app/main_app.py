@@ -13,7 +13,7 @@ from fastapi.responses import HTMLResponse
 from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 
-from app.api.v1 import auth, cart, categories, orders, products, sales, webhooks
+from app.api.v1 import auth, cart, categories, issues, orders, products, sales, webhooks
 from app.core.cors import ALLOWED_ORIGIN_REGEX, ALLOWED_ORIGINS
 from app.core.errors import UnhandledErrorsMiddleware
 from app.core.limiter import limiter
@@ -65,6 +65,7 @@ app.include_router(cart.router, prefix="/api/v1/cart", tags=["cart"])
 app.include_router(orders.router, prefix="/api/v1/orders", tags=["orders"])
 app.include_router(webhooks.router, prefix="/api/v1/webhooks", tags=["webhooks"])
 app.include_router(sales.router, prefix="/api/v1/sales", tags=["sales"])
+app.include_router(issues.router, prefix="/api/v1/issues", tags=["issues"])
 
 
 # Google Search Console busca esta etiqueta en el HTML de la página de

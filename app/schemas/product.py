@@ -99,6 +99,11 @@ class ProductRead(ProductBase):
     # que ya la usa.
     image_url: str | None = None
 
+    # Promedio de quienes ya lo recibieron. None si nadie ha calificado:
+    # un 0 parecería que salió mal.
+    rating_average: float | None = None
+    rating_count: int = 0
+
     model_config = ConfigDict(from_attributes=True)
 
 
